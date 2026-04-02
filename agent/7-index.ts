@@ -1,4 +1,7 @@
-import { printHarnessResult, runHarness, verifySuccessfulUpvote } from "./6-harness.js";
+import { createTools } from "./1-tools.js";
+import { createContext } from "./3-context.js";
+import { runLoop } from "./5-loop.js";
+import { BrowserSession } from "./browser.js";
 
 // try a shitty model
 const MODEL = "openai/gpt-3.5-turbo-0613";
@@ -15,5 +18,18 @@ Click its upvote arrow using the exact selector: a[id="up_STORYID"] (replace STO
 console.log(`Model: ${MODEL}`);
 console.log(`Task:  upvote on Hacker News\n`);
 
-const result = await runHarness(TASK, MODEL, { verify: verifySuccessfulUpvote, maxAttempts: 3 });
-printHarnessResult(result);
+const session = new BrowserSession();
+
+try {
+  await session.open();
+
+  const tools = createTools(session);
+  const messages = createContext(TASK);
+  const result = await runLoop(MODEL, messages, tools);
+
+  console.log(`\nAnswer: ${result.answer}`);
+  console.log(`Stopped by: ${result.stoppedBy}`);
+  console.log(`Iterations: ${result.iterations}`);
+} finally {
+  await session.close();
+}
