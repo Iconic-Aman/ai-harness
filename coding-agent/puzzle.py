@@ -1,20 +1,14 @@
-def find_self_describing_number():
-    """
-    Function to find and print a 10-digit self-describing number.
+import itertools
+import time
 
-    A self-describing number is a number that describes its own digits.
-    For example, a self-describing number '10201' describes its digits as:
-    - 1 zero
-    - 2 ones
-    - 0 twos
-    - 1 three
-    - 1 four
-    """
-    for num in range(10**(4), 10**(5)):  # Range of possible 10-digit numbers
-        str_num = str(num)
-        if str_num == ''.join(str(x) for x in [str_num.count('0'), str_num.count('1'), str_num.count('2'), str_num.count('3'), str_num.count('4'), \
-                                              str_num.count('5'), str_num.count('6'), str_num.count('7'), str_num.count('8'), str_num.count('9')]):
-            print(num)
-            break
+def find(self_describing_num):
+    for i in range(1,10000000000):
+        s = str(i)
+        count = [0]*10
+        for c in s:
+            count[int(c)] += 1
+        if count == [int(x) for x in s]:
+            return i
+    return 0
 
-find_self_describing_number()
+print(find(0))
