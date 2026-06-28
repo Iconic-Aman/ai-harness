@@ -138,10 +138,10 @@ npx tsx coding-agent/index.ts
 3. **Toggle Harness Mode**: Open [coding-agent/index.ts](file:///d:/working-place/agent-harness/ai-harness/coding-agent/index.ts) and comment/uncomment the lines to switch modes:
 ```typescript
 // Mode A: Run WITH harness
-await runLoop(messages, __dirname);
+// await runLoop(messages, __dirname);
 
 // Mode B: Run WITHOUT harness
-// await runWithoutHarness(messages, __dirname);
+await runWithoutHarness(messages, __dirname);
 ```
 
 ---
