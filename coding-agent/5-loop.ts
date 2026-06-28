@@ -1,49 +1,10 @@
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
-import { client, LLM_MODEL } from "./2-model.js";
-import { tools, runPythonCode } from "./1-tools.js";
+import { writeFileSync } from "fs";
+import { execSync } from "child_process";
+import { resolve } from "path";
+import { client, LLM_MODEL, parseModelArgs } from "./2-model.js";
+import { tools, runPythonCode, fetchApiData } from "./1-tools.js";
 import { verifyOutput } from "./4-guardrails.js";
-
-// Helper function to handle both valid JSON and the 8b model's broken format
-function parseModelArgs(raw: string): Record<string, string> {
-  try {
-    return JSON.parse(raw);
-  } catch {
-    // 1. Check for JSON-like structure with unescaped raw newlines (e.g. {"code": "..."})
-    const jsonLikeMatch = raw.match(/"code"\s*:\s*"([\s\S]*?)"\s*}\s*$/);
-    if (jsonLikeMatch) {
-      let code = jsonLikeMatch[1]
-        .replace(/\\"/g, '"')
-        .replace(/\\\\/g, '\\')
-        .replace(/\\n/g, '\n')
-        .replace(/\\t/g, '\t');
-      return { code };
-    }
-
-    // 2. Check for key="value" or key = "value"
-    const result: Record<string, string> = {};
-    const matches = raw.matchAll(/(\w+)\s*=\s*"([\s\S]*?)(?="?\s*(?:,\s*\w+=|}\s*$))/g);
-    for (const m of matches) {
-      result[m[1]] = m[2];
-    }
-    if (Object.keys(result).length > 0) return result;
-
-    // 3. Check for key: "value" or "key": "value" inside braces
-    const braceMatches = raw.matchAll(/"?(\w+)"?\s*[:=]\s*"([\s\S]*?)(?="?\s*(?:,\s*"?\w+"?[:=]|}|\s*$))/g);
-    for (const m of braceMatches) {
-      result[m[1]] = m[2];
-    }
-    if (Object.keys(result).length > 0) return result;
-
-    // 4. Fallback: match everything after code= or code: or "code":
-    const fallback = raw.match(/(?:code|arguments)\s*[:=]\s*([\s\S]+)/s);
-    if (fallback) {
-      let code = fallback[1].replace(/^["']|["'}]+$/g, "").trim();
-      return { code };
-    }
-
-    throw new Error("Could not parse model args: " + raw);
-  }
-}
 
 // Orchestrate loop iterations
 export async function runLoop(
@@ -74,12 +35,27 @@ export async function runLoop(
             let result = runPythonCode(args.code, workingDir);
             console.log(`Result: ${result.slice(0, 150)}`);
 
-            if (verifyOutput(result, workingDir)) {
-              console.log("\nSuccess: Weather file created!");
+            const verification = await verifyOutput(result, workingDir);
+            if (verification.passed) {
+              console.log("\nSuccess: Weather summary JSON file created!");
               return;
-            } else if (!result.startsWith("Error:")) {
-              result = "Error: The script executed successfully, but 'weather.html' was either not created or did not contain valid HTML/weather data. Please ensure you write the data to 'weather.html' and complete the task.";
+            } else {
+              if (result.startsWith("Error: Traceback") || result.startsWith("Error: SyntaxError") || result.includes("SyntaxWarning")) {
+                // Keep the traceback/syntax error
+              } else {
+                result = `Error: Verification failed. Reason: ${verification.reason || "Invalid data"}`;
+              }
             }
+
+            messages.push({
+              role: "tool",
+              tool_call_id: toolCall.id,
+              content: result,
+            });
+          } else if (toolCall.function.name === "fetch_api_data") {
+            console.log("Fetching API data...");
+            const result = await fetchApiData();
+            console.log(`Result: ${result.slice(0, 150)}...`);
 
             messages.push({
               role: "tool",
@@ -90,8 +66,9 @@ export async function runLoop(
         }
       } else {
         console.log(`Model Response: ${choice.message.content}`);
-        if (verifyOutput("", workingDir)) {
-          console.log("\nSuccess: Weather file created!");
+        const verification = await verifyOutput("", workingDir);
+        if (verification.passed) {
+          console.log("\nSuccess: Weather summary JSON file created!");
           return;
         }
         messages.push({
@@ -115,12 +92,42 @@ export async function runLoop(
               let result = runPythonCode(args.code, workingDir);
               console.log(`Result: ${result.slice(0, 150)}`);
 
-              if (verifyOutput(result, workingDir)) {
-                console.log("\nSuccess: Weather file created via intercepted tool call!");
+              const verification = await verifyOutput(result, workingDir);
+              if (verification.passed) {
+                console.log("\nSuccess: Weather summary JSON file created via intercepted tool call!");
                 return;
-              } else if (!result.startsWith("Error:")) {
-                result = "Error: The script executed successfully, but 'weather.html' was either not created or did not contain valid HTML/weather data. Please ensure you write the data to 'weather.html' and complete the task.";
+              } else {
+                if (result.startsWith("Error: Traceback") || result.startsWith("Error: SyntaxError") || result.includes("SyntaxWarning")) {
+                  // Keep the traceback/syntax error
+                } else {
+                  result = `Error: Verification failed. Reason: ${verification.reason || "Invalid data"}`;
+                }
               }
+
+              const toolCallId = "call_" + Math.random().toString(36).substring(2, 9);
+              messages.push({
+                role: "assistant",
+                content: null,
+                tool_calls: [{
+                  id: toolCallId,
+                  type: "function",
+                  function: {
+                    name: funcName,
+                    arguments: funcArgsStr,
+                  },
+                }],
+              });
+
+              messages.push({
+                role: "tool",
+                tool_call_id: toolCallId,
+                content: result,
+              });
+              continue;
+            } else if (funcName === "fetch_api_data") {
+              console.log("Fetching API data (intercepted)...");
+              const result = await fetchApiData();
+              console.log(`Result: ${result.slice(0, 150)}...`);
 
               const toolCallId = "call_" + Math.random().toString(36).substring(2, 9);
               messages.push({
@@ -152,5 +159,29 @@ export async function runLoop(
       break;
     }
   }
-  console.log("\nFailed to solve the puzzle within iteration limit.");
+  console.log("\nFailed to complete the task within iteration limit.");
+}
+
+// Direct execution mode: runs the model once, extracts code, and executes it directly without harness loop/verification
+export async function runWithoutHarness(
+  messages: ChatCompletionMessageParam[],
+  workingDir: string
+): Promise<void> {
+  console.log(`\n[Running WITHOUT Harness] Calling model...`);
+  try {
+    const response = await client.chat.completions.create({
+      model: LLM_MODEL,
+      messages,
+    });
+    const content = response.choices[0].message.content || "";
+    console.log("\nResponse from model:\n", content);
+
+    const pythonCodeMatch = content.match(/```python\n([\s\S]*?)\n```/);
+    const pythonCode = pythonCodeMatch ? pythonCodeMatch[1] : content;
+
+    console.log("\nExecuting the python script directly in-memory...");
+    execSync("python", { cwd: workingDir, stdio: "inherit", input: pythonCode, encoding: "utf8" });
+  } catch (error) {
+    console.error("Error running without harness:", error);
+  }
 }
