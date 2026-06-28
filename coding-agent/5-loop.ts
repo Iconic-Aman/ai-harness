@@ -21,6 +21,7 @@ export async function runLoop(
         model: LLM_MODEL,
         messages,
         tools,
+        temperature: 0.1,
       });
 
       const choice = response.choices[0];
@@ -172,6 +173,7 @@ export async function runWithoutHarness(
     const response = await client.chat.completions.create({
       model: LLM_MODEL,
       messages,
+      temperature: 0.1,
     });
     const content = response.choices[0].message.content || "";
     console.log("\nResponse from model:\n", content);

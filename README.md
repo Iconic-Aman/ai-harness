@@ -59,117 +59,90 @@ Both are in this repo so you can see them side by side.
 ## What's in this repo
 
 ```
-eval/        ← the eval harness (older meaning)
-agent/       ← the agent harness (newer meaning)
+coding-agent/       ← the agent harness implementation
 ```
 
-### `eval/` — test a model against known answers
+### `coding-agent/` — give a model a task, an environment, and a verification loop
 
 ```
-dataset → model → scorer → pass/fail → summary
-```
-
-| File | Part | What it does |
-|---|---|---|
-| `1-dataset.ts` | Dataset | Fixed test cases with known expected outputs. Designed to trigger common hallucinations — the "obvious" answer is usually wrong. |
-| `2-model.ts` | Model | Calls any OpenRouter model with a prompt, returns a string. |
-| `3-scorers.ts` | Scorers | `exactMatch`, `contains`, `keywords` — normalizes number words ("Three" → "3") before comparing. |
-| `4-runner.ts` | Runner | Loops over cases, scores each, tracks whether the model fell for the trap answer. |
-| `5-index.ts` | Output | Runs multiple models against the same dataset, prints side-by-side comparison. |
-
-```sh
-npm run eval
-```
-
-### `agent/` — give a model a task and an environment
-
-```
-task → [tools + context + guardrails + loop + verify] → result
+task → [tools + context + guardrails + loop + verification] → result
 ```
 
 | File | Part | What it does |
 |---|---|---|
-| `1-tools.ts` | Tool registry | `createTools(session)` — tools are bound to the environment the harness provides, not a global they reach into. |
-| `2-model.ts` | Model client | OpenRouter via the OpenAI SDK. Swap models by changing one string. |
-| `3-context.ts` | Context / state | Builds initial context, trims old messages to prevent context rot. |
-| `4-guardrails.ts` | Guardrails | Composable safety checks (max iterations, max messages) that run before every loop iteration. |
-| `5-loop.ts` | Agent loop | Call model → use tools → feed result back → repeat. Stops when model answers or guardrail fires. |
-| `6-harness.ts` | The harness | Owns the full lifecycle: opens environment, creates tools, runs loop, verifies answer, closes environment. |
-| `browser.ts` | Environment | A `BrowserSession` — one isolated browser page per harness run, managed entirely by the harness. |
+| `1-tools.ts` | Tool registry | Defines `run_python_code` (runs python scripts in-memory via stdin) and `fetch_api_data` (retrieves raw JSON from the weather API). |
+| `2-model.ts` | Model client | Configures the `OpenAI` client (pointing to Groq) and implements `parseModelArgs` to handle XML-style tool calls and unescaping. |
+| `3-context.ts` | Context / state | Builds the initial system prompt and user task context. |
+| `4-guardrails.ts` | Verification | `verifyOutput` fetches the weather API itself, calculates ground-truth values (temp in Fahrenheit and wind speed in mph), and compares them to the generated file. |
+| `5-loop.ts` | Agent loop | Call model → execute tools (standard or XML-intercepted) → feed results/crashes back → repeat. Supports a togglable harness/non-harness execution mode. |
+| `index.ts` | Entrypoint | Starts the context and triggers either `runLoop` (with harness) or `runWithoutHarness` (without harness). |
 
 ```sh
-npm run agent
+npx tsx coding-agent/index.ts
 ```
 
 ---
 
 ## How the agent demo works
 
-The task requires live data from the web:
+The task requires downloading weather data from an API, parsing it, converting values, and saving the results:
 
-> "Go to https://news.ycombinator.com and tell me the exact title and current point score of the #1 story right now."
+> "Write a Python script that downloads the weather data from the URL specified by the 'WEATHER_API_URL' environment variable. Parse the JSON to extract the current temperature and wind speed, convert the temperature to Fahrenheit and the wind speed to miles per hour, and save a JSON file named 'weather_summary.json' containing the keys 'temp_f' and 'wind_mph'."
 
-The demo runs this against two models sequentially. Each gets its own browser session, opened and closed by the harness.
+*(Note: The actual weather API URL used for this demo is: `https://api.open-meteo.com/v1/forecast?latitude=52.52&longitude=13.41&current=temperature_2m,wind_speed_10m`)*
 
-**A model with good tool use** (e.g. `gpt-4o-mini`):
-```
-[iter 1] called 2 tool(s)  [ctx: 2 msgs]
-           → browser_navigate({"url":"https://news.ycombinator.com"})
-           → browser_get_text({})
-             ...Hacker News | #1: "Some Title" | 847 points...
-[iter 2] answered  [ctx: 6 msgs]
+### Without the Harness (Mode B)
+The model tries to write the Python script in one shot. It guesses the API's JSON keys (e.g. trying `['temp_c']` or `['current']['temp']`). Because it doesn't know the exact structure, the script either crashes or saves incorrect dummy data (`0` or `None`), and the execution stops.
 
-Answer:  The #1 story is "Some Title" with 847 points.
-Verify:  ✓ PASS — Answer contains a point score
-```
-
-**A model that skips tools** (e.g. `stepfun/step-3.5-flash:free`):
-```
-[iter 1] answered  [ctx: 2 msgs]
-
-Answer:  The top story on Hacker News is "Some Made-Up Title" with 312 points.
-Verify:  ✗ FAIL — No point score found in answer
-```
-
-The contrast makes three things visible at once:
-
-- **Tools**: one model opens a real browser, the other hallucinates
-- **Context**: message count grows with each tool call — you can watch it
-- **Verify**: both models stopped without hitting a guardrail. The harness looked successful either way. Only the verify step caught the semantic failure.
-
-That last point is the key insight: **guardrails catch structural failures. Verify catches wrong answers. You need both.**
+### With the Harness (Mode A)
+1. **Iteration 1**: The model attempts to parse the weather JSON using guessed keys (like `['main']['temp']`), which fails with a `KeyError`.
+2. **Harness Intervention**: The harness catches the `KeyError` traceback, appends it to the history, and injects a hint: *"Hint: Please call the 'fetch_api_data' tool to inspect the raw JSON structure."*
+3. **Iteration 2**: The model reads the hint, calls `fetch_api_data` to inspect the API's actual keys (`temperature_2m`, `wind_speed_10m`), and gets the correct structure.
+4. **Iteration 3**: The model writes the correct parsing code. The harness runs it in-memory, verifies the generated `weather_summary.json` against the live API values, and terminates with **Success**.
 
 ---
 
 ## The harness owns the environment
 
-The architectural decision that makes this a real harness rather than just a loop with tools:
+The architectural decision that makes this a real harness:
 
 ```
-runHarness()
-  ├── session = new BrowserSession()   ← harness opens the environment
-  ├── tools   = createTools(session)   ← tools are bound to this session
-  ├── messages = createContext(task)   ← fresh context for this task
-  ├── result  = await runLoop(...)     ← loop runs inside the environment
-  └── session.close()                  ← always, even on error
+main()
+  ├── messages = createContext()       ← fresh context for this task
+  ├── runLoop(messages, workingDir)    ← loop runs inside the environment
+       ├── fetchApiData()              ← harness retrieves the raw API JSON
+       ├── runPythonCode(code)         ← harness executes python in-memory via stdin
+       └── verifyOutput(result)        ← harness performs ground-truth validation
 ```
 
-Tools don't manage the browser. They don't know about the browser lifecycle. The harness opens it, the harness closes it, and the process exits cleanly. That's what "managing input/output behind the scenes" means in practice.
+Tools do not manage the execution lifecycle. The harness executes the code, captures stderr, feeds it back, and validates the output against the ground truth.
 
 ---
 
 ## Setup
 
-```sh
-cp .env.example .env
-# add your OPENROUTER_API_KEY
-npm install
-npx playwright install chromium
-npm run eval    # or
-npm run agent
+1. Configure your `.env` file inside `coding-agent/`:
+```env
+GROQ_API_KEY=your_groq_api_key
+GROQ_MODEL=llama-3.1-8b-instant
+GROQ_BASE_URL=https://api.groq.com/openai/v1
+WEATHER_API_URL=https://api.open-meteo.com/v1/forecast?latitude=52.52&longitude=13.41&current=temperature_2m,wind_speed_10m
 ```
 
-Get an OpenRouter key at [openrouter.ai](https://openrouter.ai).
+2. Run the script:
+```sh
+npm install
+npx tsx coding-agent/index.ts
+```
+
+3. **Toggle Harness Mode**: Open [coding-agent/index.ts](file:///d:/working-place/agent-harness/ai-harness/coding-agent/index.ts) and comment/uncomment the lines to switch modes:
+```typescript
+// Mode A: Run WITH harness
+await runLoop(messages, __dirname);
+
+// Mode B: Run WITHOUT harness
+// await runWithoutHarness(messages, __dirname);
+```
 
 ---
 
@@ -178,3 +151,6 @@ Get an OpenRouter key at [openrouter.ai](https://openrouter.ai).
 - Mitchell Hashimoto, [My AI Adoption Journey](https://mitchellh.com/writing/my-ai-adoption-journey) (February 2026) — coined "harness engineering" in its current agentic meaning
 - Anthropic, [Effective context engineering for AI agents](https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents) — context engineering as a core harness component
 - EleutherAI, [lm-evaluation-harness](https://github.com/EleutherAI/lm-evaluation-harness) — the older eval harness meaning (2021)
+- Tejas Kumar, [Harnesses in AI: A Deep Dive — Tejas Kumar, IBM](https://www.youtube.com/watch?v=C_GG5g38vLU) — explanation of agent harness structures and concepts
+
+

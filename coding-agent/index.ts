@@ -11,8 +11,8 @@ async function main() {
   const messages = createContext();
 
   // TOGGLE HARNESS MODE: Comment/uncomment the lines below to switch modes
-  // await runLoop(messages, __dirname); // Mode A: Run WITH harness
-  await runWithoutHarness(messages, __dirname); // Mode B: Run WITHOUT harness
+  await runLoop(messages, __dirname); // Mode A: Run WITH harness
+  // await runWithoutHarness(messages, __dirname); // Mode B: Run WITHOUT harness
 }
 
 main();
